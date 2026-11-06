@@ -1,0 +1,21 @@
+# workspace: videos never go to git
+inqueue/
+InProgress/
+Done/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.m4v
+*.avi
+*.png
+*.zip
+
+# downloaded Real-ESRGAN
+bin/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.claude/

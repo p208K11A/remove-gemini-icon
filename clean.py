@@ -26,7 +26,7 @@ import numpy as np
 from _common import FFMPEG, FFPROBE, HERE
 
 MASK = HERE / "gemini_star_alpha_720p.npy"
-OX, OY = 1104, 544          # top-left of the 112x112 mask in a 1280x720 frame
+OX, OY = 1104, 544          # top-left of the 112x112 mask in a 1280x720 frame (64px margin from right/bottom)
 MASK_FRAME = (1280, 720)
 REALESRGAN = HERE / "bin" / "realesrgan" / ("realesrgan-ncnn-vulkan" + (".exe" if sys.platform == "win32" else ""))
 AI_MODELS = {"realesrgan-x4plus": (4,), "realesr-animevideov3": (2, 3, 4)}
@@ -50,21 +50,29 @@ def box_blur(img, k=3):
 
 
 class Watermark:
-    def __init__(self, mask=MASK):
+    def __init__(self, mask=MASK, ox=None, oy=None, w=None, h=None):
         a = np.load(mask).astype(np.float32)
         self.S = a.shape[0]
         self.a = a[None, :, :, None]
         inside = (a > 0.15).astype(np.float32)[None, :, :, None]
         edge = np.clip(np.abs(inside - box_blur(inside)) * 4, 0, 1)   # ~1px each side of the outline
         self.edge = np.clip(box_blur(edge) * 1.5, 0, 1)                # widen + feather to ~2px
+        if ox is not None and oy is not None:
+            self.ox, self.oy = int(ox), int(oy)
+        elif w is not None and h is not None:
+            self.ox = w - self.S - 64
+            self.oy = h - self.S - 64
+        else:
+            self.ox, self.oy = OX, OY
 
     def __call__(self, frames):
-        """frames: (N, 720, 1280, 3) uint8, fixed in place."""
+        """frames: (N, H, W, 3) uint8, fixed in place."""
         S = self.S
-        r = frames[:, OY:OY + S, OX:OX + S].astype(np.float32)
+        ox, oy = self.ox, self.oy
+        r = frames[:, oy:oy + S, ox:ox + S].astype(np.float32)
         fixed = (r - self.a * 255.0) / (1 - self.a)
         fixed = fixed * (1 - self.edge) + box_blur(fixed) * self.edge
-        frames[:, OY:OY + S, OX:OX + S] = np.clip(fixed, 0, 255).round().astype(np.uint8)
+        frames[:, oy:oy + S, ox:ox + S] = np.clip(fixed, 0, 255).round().astype(np.uint8)
         return frames
 
 
@@ -106,18 +114,39 @@ class AIUpscaler:
                          for i in range(len(frames))])
 
 
-def clean(src, dst, size="1920x1080", sharpen=None, watermark=True, ai=False,
-          ai_model="realesr-animevideov3", crf=16, log=print):
+def clean(src, dst, size=None, sharpen=None, watermark=True, ai=False,
+          ai_model="realesr-animevideov3", crf=16, pos=None, log=print):
     src, dst = Path(src), Path(dst)
     w, h, fps = probe(src)
-    if watermark and (w, h) != MASK_FRAME:
-        raise SystemExit(f"{src.name}: the watermark mask is calibrated for 1280x720, this video is {w}x{h}. "
-                         "Use --no-watermark to only upscale, or calibrate a new mask (see README).")
+
+    if pos:
+        ox, oy = (int(v) for v in pos.split(","))
+    else:
+        # Default Gemini/Veo icon position: 64px from right and bottom edges
+        ox = w - 112 - 64
+        oy = h - 112 - 64
+
+    if watermark:
+        if ox < 0 or oy < 0 or ox + 112 > w or oy + 112 > h:
+            raise SystemExit(f"{src.name}: video {w}x{h} too small for watermark removal at ({ox}, {oy}). "
+                             "Use --no-watermark to only upscale, or calibrate a new mask (see README).")
+
     if sharpen is None:
         sharpen = 0.3 if ai else 0.8
-    ow, oh = (int(v) for v in size.lower().split("x"))
 
-    steps = [Watermark()] if watermark else []
+    if size is None:
+        if (w, h) == (1280, 720) or abs(w / h - 16 / 9) < 0.05:
+            ow, oh = 1920, 1080
+        elif w == h:
+            ow, oh = (1080, 1080) if w <= 1080 else (w, h)
+        else:
+            ow, oh = w, h
+    elif size.lower() in ("keep", "same", "original"):
+        ow, oh = w, h
+    else:
+        ow, oh = (int(v) for v in size.lower().split("x"))
+
+    steps = [Watermark(ox=ox, oy=oy, w=w, h=h)] if watermark else []
     in_w, in_h = w, h
     tmp = None
     if ai:
@@ -159,7 +188,8 @@ def clean(src, dst, size="1920x1080", sharpen=None, watermark=True, ai=False,
 
 
 def add_args(ap):
-    ap.add_argument("--size", default="1920x1080", help="output size, e.g. 1920x1080 or 3840x2160")
+    ap.add_argument("--size", default=None, help="output size, e.g. 1920x1080, 1080x1080 or keep (default: 1920x1080 for 16:9, 1080x1080 for 1:1)")
+    ap.add_argument("--pos", help="watermark top-left x,y (default: auto bottom-right with 64px margin)")
     ap.add_argument("--sharpen", type=float, help="unsharp amount, 0 = off .. 1.2 strong "
                                                   "(default 0.8, or 0.3 with --ai)")
     ap.add_argument("--no-watermark", dest="watermark", action="store_false",
@@ -172,7 +202,7 @@ def add_args(ap):
 
 
 def opts(a):
-    return dict(size=a.size, sharpen=a.sharpen, watermark=a.watermark, ai=a.ai, ai_model=a.ai_model, crf=a.crf)
+    return dict(size=a.size, sharpen=a.sharpen, watermark=a.watermark, ai=a.ai, ai_model=a.ai_model, crf=a.crf, pos=a.pos)
 
 
 if __name__ == "__main__":
